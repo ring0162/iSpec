@@ -142,46 +142,126 @@ def _check_data():
 
 def _read_harps_s1d(fits_path: str) -> np.recarray:
     """
-    Read a HARPS S1D merged 1-D spectrum (*_s1d_A.fits).
+    Read a HARPS / custom merged 1-D spectrum.
 
-    The HARPS DRS writes a single 1-D flux array into the PRIMARY HDU with
-    linear WCS keywords:
-        CRVAL1   – wavelength of pixel 1 (Ångström)
-        CDELT1   – dispersion (Å per pixel)
-        CRPIX1   – reference pixel (usually 1)
+    Handles three layouts in order of preference:
 
-    There is no separate error extension in standard HARPS S1D products;
-    the error array is left as zeros and is not used by the fitter when
-    all values are zero (continuum normalisation handles that case).
+    1. Standard DRS S1D (*_s1d_A.fits): 1-D flux array in PRIMARY HDU with
+       linear WCS keywords CRVAL1/CDELT1/CRPIX1 (Ångström).
+
+    2. BinTableHDU spectrum (e.g. stacked/master products with empty PRIMARY):
+       Searches all BinTable extensions for columns whose names contain WAVE,
+       FLUX, and ERR (case-insensitive).  Falls back to positional column
+       assignment (col 0 = wave, col 1 = flux, col 2 = err) when column names
+       are ambiguous.
+
+    3. ImageHDU extensions: treats the first ImageHDU with data as the flux
+       array and attempts WCS wavelength derivation from its header.
     """
     from astropy.io import fits
+    from astropy.io.fits import BinTableHDU, ImageHDU
 
     log.info("Reading HARPS S1D file: %s", fits_path)
 
     with fits.open(fits_path) as hdul:
         hdul.info()
         primary = hdul[0]
-        hdr  = primary.header
-        flux = primary.data.astype(float).flatten()
 
-        npix  = len(flux)
-        crval = float(hdr.get("CRVAL1", 0.0))    # Å
-        cdelt = float(hdr.get("CDELT1", hdr.get("CD1_1", 1.0)))  # Å/pix
-        crpix = float(hdr.get("CRPIX1", 1.0))
+        # ------------------------------------------------------------------
+        # Strategy 1: flux data in PRIMARY HDU (standard DRS S1D)
+        # ------------------------------------------------------------------
+        if primary.data is not None:
+            hdr  = primary.header
+            flux = primary.data.astype(float).flatten()
+            npix  = len(flux)
+            crval = float(hdr.get("CRVAL1", 0.0))
+            cdelt = float(hdr.get("CDELT1", hdr.get("CD1_1", 1.0)))
+            crpix = float(hdr.get("CRPIX1", 1.0))
+            wave  = crval + (np.arange(npix) - (crpix - 1)) * cdelt  # Å
 
-        wave = crval + (np.arange(npix) - (crpix - 1)) * cdelt   # Å
+            err = np.zeros_like(flux)
+            for hdu in hdul[1:]:
+                if isinstance(hdu, ImageHDU) and hdu.data is not None:
+                    name = hdu.name.upper()
+                    if any(k in name for k in ("ERR", "SIGMA", "NOISE", "STAT")):
+                        err = hdu.data.astype(float).flatten()
+                        break
 
-        # Error: look for a STAT or ERR extension; otherwise zeros
-        err = np.zeros_like(flux)
+            log.info("Strategy 1 (PRIMARY WCS): %d pixels", len(flux))
+            return _build_spectrum(wave, flux, err, angstrom=True)
+
+        # ------------------------------------------------------------------
+        # Strategy 2: BinTableHDU extension (stacked / master spectra)
+        # ------------------------------------------------------------------
         for hdu in hdul[1:]:
-            from astropy.io.fits import ImageHDU
-            if isinstance(hdu, ImageHDU) and hdu.data is not None:
-                name = hdu.name.upper()
-                if any(k in name for k in ("ERR", "SIGMA", "NOISE", "STAT")):
-                    err = hdu.data.astype(float).flatten()
-                    break
+            if not isinstance(hdu, BinTableHDU) or hdu.data is None:
+                continue
 
-    return _build_spectrum(wave, flux, err, angstrom=True)
+            cols = [c.upper() for c in hdu.columns.names]
+            orig = hdu.columns.names
+
+            wave_col = _first_match(orig, ["WAVE", "WAVELENGTH", "LAMBDA",
+                                           "WAVE_AIR", "AWAV", "WAVEOBS"])
+            flux_col = _first_match(orig, ["FLUX", "FLUX_REDUCED", "SCIFLUX",
+                                           "COUNTS", "INTENSITY"])
+            err_col  = _first_match(orig, ["ERR", "ERROR", "SIGMA", "NOISE",
+                                           "FLUX_ERR", "EFLUX"])
+
+            # Fall back to positional assignment when column names are not
+            # recognisable (some master pipelines use generic col names)
+            if wave_col is None and len(orig) >= 2:
+                log.warning(
+                    "BinTable column names %s not recognised; "
+                    "assuming col 0 = wave, col 1 = flux, col 2 = err.",
+                    orig,
+                )
+                wave_col = orig[0]
+                flux_col = orig[1]
+                err_col  = orig[2] if len(orig) >= 3 else None
+
+            if wave_col is None or flux_col is None:
+                continue
+
+            wave = np.asarray(hdu.data[wave_col], dtype=float).flatten()
+            flux = np.asarray(hdu.data[flux_col], dtype=float).flatten()
+            err  = (np.asarray(hdu.data[err_col], dtype=float).flatten()
+                    if err_col else np.zeros_like(flux))
+
+            # Detect unit: treat values > 1000 as Ångström, else nm
+            angstrom = bool(np.nanmedian(wave) > 1000)
+            log.info(
+                "Strategy 2 (BinTableHDU '%s'): %d pixels, "
+                "wave %.1f–%.1f %s",
+                hdu.name, len(flux),
+                float(np.nanmin(wave)), float(np.nanmax(wave)),
+                "Å" if angstrom else "nm",
+            )
+            return _build_spectrum(wave, flux, err, angstrom=angstrom)
+
+        # ------------------------------------------------------------------
+        # Strategy 3: first ImageHDU extension with data
+        # ------------------------------------------------------------------
+        for hdu in hdul[1:]:
+            if isinstance(hdu, ImageHDU) and hdu.data is not None:
+                hdr  = hdu.header
+                flux = hdu.data.astype(float).flatten()
+                npix  = len(flux)
+                crval = float(hdr.get("CRVAL1", 0.0))
+                cdelt = float(hdr.get("CDELT1", hdr.get("CD1_1", 1.0)))
+                crpix = float(hdr.get("CRPIX1", 1.0))
+                wave  = crval + (np.arange(npix) - (crpix - 1)) * cdelt
+                err   = np.zeros_like(flux)
+                log.info("Strategy 3 (ImageHDU '%s' WCS): %d pixels", hdu.name, len(flux))
+                return _build_spectrum(wave, flux, err, angstrom=True)
+
+    raise ValueError(
+        f"Could not read a 1-D spectrum from {fits_path}.\n"
+        "The file has no flux data in the PRIMARY HDU and no recognised "
+        "BinTable or Image extension.  Run:\n"
+        "  python -c \"from astropy.io import fits; "
+        f"fits.open('{fits_path}').info()\"\n"
+        "to inspect the file structure."
+    )
 
 
 def _harps_wave_from_header(hdr, n_orders: int, npix: int) -> np.ndarray:
