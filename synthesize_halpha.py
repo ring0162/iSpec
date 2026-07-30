@@ -336,8 +336,16 @@ def report_lines_in_window(waveobs: np.ndarray, flux: np.ndarray,
 
     rows = []
     for line in candidates:
-        wl      = float(line["wave_nm"])
-        species = str(line["element"]).strip()
+        wl            = float(line["wave_nm"])
+        species       = str(line["element"]).strip()
+        theo_depth    = float(line["theoretical_depth"])
+
+        # Require the solar theoretical depth to pass the threshold first.
+        # This prevents weak lines near the H-alpha core from inheriting
+        # H-alpha's measured depth due to an overlapping measurement window.
+        if theo_depth < depth_threshold:
+            continue
+
         w_lo = wl - measure_window_nm
         w_hi = wl + measure_window_nm
         pix  = (waveobs >= w_lo) & (waveobs <= w_hi)
