@@ -112,6 +112,7 @@ def load_params(results_dir: Path | None,
     }
 
     params = dict(defaults)
+    abundances_list = []
 
     if results_dir is not None:
         json_path = results_dir / "stellar_params.json"
@@ -122,6 +123,7 @@ def load_params(results_dir: Path | None,
             for k in ("teff", "logg", "MH", "alpha", "vmic", "vmac", "vsini"):
                 if k in fitted:
                     params[k] = float(fitted[k])
+            abundances_list = list(data.get("abundances", []))
             log.info("Loaded parameters from %s", json_path)
             log.info(
                 "  Teff=%.1f K  logg=%.3f  [M/H]=%.3f  "
@@ -129,6 +131,11 @@ def load_params(results_dir: Path | None,
                 params["teff"], params["logg"], params["MH"],
                 params["vmic"], params["vmac"], params["vsini"],
             )
+            if abundances_list:
+                log.info(
+                    "  Fitted individual abundances: %s",
+                    ", ".join(f"{a['element']}={a['Abund']:+.3f}" for a in abundances_list),
+                )
         else:
             log.warning("stellar_params.json not found in %s; using defaults.", results_dir)
 
@@ -142,7 +149,57 @@ def load_params(results_dir: Path | None,
     if cli_overrides.get("alpha") is None and results_dir is None:
         params["alpha"] = float(ispec.determine_abundance_enchancements(params["MH"]))
 
-    return params
+    return params, abundances_list
+
+
+def apply_abundance_overrides(abundances_list: list, overrides: list) -> list:
+    """
+    Merge CLI --abundance ELEM=VALUE entries into abundances_list, overwriting
+    any existing entry for that element or appending a new one.
+    """
+    merged = [dict(a) for a in abundances_list]
+    for spec in overrides or []:
+        if "=" not in spec:
+            raise ValueError(f"--abundance must be ELEMENT=VALUE, got '{spec}'")
+        elem, val_str = spec.split("=", 1)
+        elem = elem.strip()
+        val = float(val_str)
+        for a in merged:
+            if a["element"] == elem:
+                a["Abund"] = val
+                break
+        else:
+            merged.append({"element": elem, "Abund": val})
+        log.info("Abundance override: %s = %+.3f dex", elem, val)
+    return merged
+
+
+def build_fixed_abundances(abundances_list: list, solar_abundances):
+    """
+    Build an iSpec fixed_abundances recarray (fields: code, Abund, element)
+    from a list of {"element": symbol, "Abund": absolute abundance} dicts,
+    e.g. as stored under the "abundances" key of stellar_params.json.
+
+    Returns None if abundances_list is empty.
+    """
+    if not abundances_list:
+        return None
+
+    chemical_elements_file = ISPEC_INPUT / "abundances" / "chemical_elements_symbols.dat"
+    chemical_elements = ispec.read_chemical_elements(str(chemical_elements_file))
+
+    elements = [a["element"] for a in abundances_list]
+    fixed_abundances = ispec.create_free_abundances_structure(
+        elements, chemical_elements, solar_abundances
+    )
+    for i, a in enumerate(abundances_list):
+        fixed_abundances["Abund"][i] = float(a["Abund"])
+
+    log.info(
+        "Applying fixed abundances: %s",
+        ", ".join(f"{a['element']}={a['Abund']:+.3f}" for a in abundances_list),
+    )
+    return fixed_abundances
 
 
 # ---------------------------------------------------------------------------
@@ -228,7 +285,8 @@ def synthesize_halpha(params: dict,
                       code: str = "spectrum",
                       wave_min: float = HALPHA_NM - HALPHA_WING,
                       wave_max: float = HALPHA_NM + HALPHA_WING,
-                      wave_step: float = WAVE_STEP) -> tuple[np.ndarray, np.ndarray]:
+                      wave_step: float = WAVE_STEP,
+                      fixed_abundances=None) -> tuple[np.ndarray, np.ndarray]:
     """
     Synthesize a spectrum over the H-alpha region.
 
@@ -287,7 +345,7 @@ def synthesize_halpha(params: dict,
         atmosphere_layers,
         teff, logg, MH, alpha,
         atomic_linelist, isotopes, solar_abundances,
-        fixed_abundances=None,
+        fixed_abundances=fixed_abundances,
         microturbulence_vel=vmic,
         macroturbulence=vmac,
         vsini=vsini,
@@ -550,6 +608,25 @@ def parse_args():
     pg.add_argument("--resolution", type=int,   default=None,
                     help="Instrumental resolving power R (default: from JSON, else 115000)")
 
+    # ---- Individual abundance overrides ------------------------------------
+    ag = p.add_argument_group(
+        "Individual abundances",
+        "Fixed elemental abundances applied on top of the scaled-solar mixture. "
+        "Auto-loaded from stellar_params.json's 'abundances' key (as written by "
+        "fit_harps_spectrum.py / fit_espresso_spectrum.py --abundances) if present."
+    )
+    ag.add_argument(
+        "--abundance", action="append", default=[], metavar="ELEM=VALUE",
+        help="Set/override an individual element's absolute abundance A(X), "
+             "e.g. --abundance Co=5.23. Repeatable. Overrides the value loaded "
+             "from stellar_params.json for that element, or adds it if not present."
+    )
+    ag.add_argument(
+        "--no-fixed-abundances", action="store_true",
+        help="Ignore any 'abundances' entry in stellar_params.json; use pure "
+             "scaled-solar abundances (still combinable with --abundance)."
+    )
+
     # ---- Synthesis options ------------------------------------------------
     p.add_argument(
         "--code", choices=["spectrum", "turbospectrum", "moog"],
@@ -631,7 +708,10 @@ def main():
     }
 
     # ---- 1. Load parameters ------------------------------------------------
-    params = load_params(args.results_dir, cli_overrides)
+    params, abundances_list = load_params(args.results_dir, cli_overrides)
+    if args.no_fixed_abundances:
+        abundances_list = []
+    abundances_list = apply_abundance_overrides(abundances_list, args.abundance)
 
     wave_min = HALPHA_NM - args.wing
     wave_max = HALPHA_NM + args.wing
@@ -669,6 +749,8 @@ def main():
         )
 
     # ---- 5. Synthesise H-alpha -------------------------------------------
+    fixed_abundances = build_fixed_abundances(abundances_list, solar_abundances)
+
     waveobs, flux = synthesize_halpha(
         params,
         modeled_layers_pack,
@@ -679,6 +761,7 @@ def main():
         wave_min=wave_min,
         wave_max=wave_max,
         wave_step=args.wave_step,
+        fixed_abundances=fixed_abundances,
     )
 
     # ---- 6. Line inventory in the Hα window --------------------------------
@@ -715,6 +798,12 @@ def main():
         f"  vmac   = {params['vmac']:7.2f} km/s",
         f"  vsini  = {params['vsini']:7.2f} km/s",
         f"  R      = {int(params['resolution']):>7d}",
+    ]
+    if abundances_list:
+        result_lines.append("  Fixed abundances:")
+        for a in abundances_list:
+            result_lines.append(f"    {a['element']:<4s} A(X) = {a['Abund']:+.3f} dex")
+    result_lines += [
         "",
         f"  Synthesis window:  {wave_min:.3f}–{wave_max:.3f} nm",
         f"  Line centre:       {HALPHA_NM:.3f} nm  (H-alpha)",
@@ -739,6 +828,7 @@ def main():
     # JSON summary
     summary = {
         "params":     {k: float(v) for k, v in params.items()},
+        "abundances": abundances_list,
         "halpha_nm":  HALPHA_NM,
         "wave_min_nm": float(wave_min),
         "wave_max_nm": float(wave_max),
