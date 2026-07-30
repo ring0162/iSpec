@@ -303,6 +303,88 @@ def synthesize_halpha(params: dict,
 
 
 # ---------------------------------------------------------------------------
+# Line inventory in the synthesis window
+# ---------------------------------------------------------------------------
+
+def report_lines_in_window(waveobs: np.ndarray, flux: np.ndarray,
+                           atomic_linelist,
+                           win_min: float = 655.7,
+                           win_max: float = 656.8,
+                           depth_threshold: float = 0.05,
+                           measure_window_nm: float = 0.05,
+                           out_file: Path | None = None) -> None:
+    """
+    Print (and optionally write) a table of every line in [win_min, win_max]
+    whose synthesised depth exceeds depth_threshold.
+
+    H-alpha (H I 656.279 nm) is injected explicitly because it lives in the
+    internal Hlinedata file rather than the user atomic linelist.
+
+    Parameters
+    ----------
+    waveobs, flux     : synthesised spectrum arrays (nm, normalised)
+    atomic_linelist   : iSpec recarray from read_atomic_linelist
+    win_min, win_max  : wavelength window to inspect (nm)
+    depth_threshold   : minimum depth (1 − F_min) to include in the table
+    measure_window_nm : half-width of the window used to find F_min per line (nm)
+    out_file          : if given, the table is appended to this file as well
+    """
+    # --- Collect candidate lines from the atomic linelist -------------------
+    mask = (atomic_linelist["wave_nm"] >= win_min) & \
+           (atomic_linelist["wave_nm"] <= win_max)
+    candidates = atomic_linelist[mask]
+
+    rows = []
+    for line in candidates:
+        wl      = float(line["wave_nm"])
+        species = str(line["element"]).strip()
+        w_lo = wl - measure_window_nm
+        w_hi = wl + measure_window_nm
+        pix  = (waveobs >= w_lo) & (waveobs <= w_hi)
+        if pix.sum() < 2:
+            continue
+        depth = float(1.0 - np.min(flux[pix]))
+        if depth >= depth_threshold:
+            rows.append((species, wl, depth))
+
+    # --- Inject H-alpha explicitly (not in the atomic .tsv linelist) --------
+    halpha_wl = HALPHA_NM
+    if win_min <= halpha_wl <= win_max:
+        pix = (waveobs >= halpha_wl - measure_window_nm) & \
+              (waveobs <= halpha_wl + measure_window_nm)
+        if pix.sum() >= 2:
+            halpha_depth = float(1.0 - np.min(flux[pix]))
+            # Remove any atomic-linelist entry that accidentally matched Hα
+            rows = [(s, w, d) for s, w, d in rows if abs(w - halpha_wl) > 0.01]
+            if halpha_depth >= depth_threshold:
+                rows.append(("H I", halpha_wl, halpha_depth))
+
+    # --- Sort by wavelength -------------------------------------------------
+    rows.sort(key=lambda r: r[1])
+
+    # --- Format table -------------------------------------------------------
+    header    = f"\n  Lines with depth > {depth_threshold:.2f} in {win_min:.3f}–{win_max:.3f} nm\n"
+    separator = "  " + "─" * 44
+    col_hdr   = f"  {'Species':<10}  {'Wave (nm)':>10}  {'Depth':>8}"
+    divider   = "  " + "-" * 44
+
+    lines_out = [header, separator, col_hdr, divider]
+    if rows:
+        for species, wl, depth in rows:
+            lines_out.append(f"  {species:<10}  {wl:>10.4f}  {depth:>8.4f}")
+    else:
+        lines_out.append("  (no lines above threshold)")
+    lines_out.append(separator + "\n")
+
+    text = "\n".join(lines_out)
+    print(text)
+
+    if out_file is not None:
+        with open(out_file, "a", encoding="utf-8") as f:
+            f.write(text + "\n")
+
+
+# ---------------------------------------------------------------------------
 # Equivalent-width measurement
 # ---------------------------------------------------------------------------
 
@@ -448,6 +530,20 @@ def parse_args():
         help="Half-width of EW integration window in nm (default: 1.5)"
     )
 
+    # ---- Line inventory ---------------------------------------------------
+    p.add_argument(
+        "--line-win-min", type=float, default=655.7, metavar="NM",
+        help="Blue edge of the line-inventory window in nm (default: 655.7)"
+    )
+    p.add_argument(
+        "--line-win-max", type=float, default=656.8, metavar="NM",
+        help="Red edge of the line-inventory window in nm (default: 656.8)"
+    )
+    p.add_argument(
+        "--line-depth-min", type=float, default=0.05, metavar="DEPTH",
+        help="Minimum synthesised line depth to include in the inventory table (default: 0.05)"
+    )
+
     # ---- Comparison spectrum ----------------------------------------------
     p.add_argument(
         "--observed", "-obs", default=None,
@@ -532,7 +628,16 @@ def main():
         wave_step=args.wave_step,
     )
 
-    # ---- 6. Measure equivalent width -------------------------------------
+    # ---- 6. Line inventory in the Hα window --------------------------------
+    report_lines_in_window(
+        waveobs, flux, atomic_linelist,
+        win_min=args.line_win_min,
+        win_max=args.line_win_max,
+        depth_threshold=args.line_depth_min,
+        out_file=output_dir / "halpha_synth.log",
+    )
+
+    # ---- 7. Measure equivalent width -------------------------------------
     ew_nm = measure_ew(waveobs, flux, centre_nm=HALPHA_NM,
                        window_nm=args.ew_window)
     ew_ang = ew_nm * 10.0   # nm → Å
@@ -541,7 +646,7 @@ def main():
         args.ew_window, ew_nm, ew_ang,
     )
 
-    # ---- 7. Print results -------------------------------------------------
+    # ---- 8. Print results -------------------------------------------------
     separator = "─" * 60
     result_lines = [
         "",
@@ -567,7 +672,7 @@ def main():
     with open(output_dir / "halpha_synth.log", "a", encoding="utf-8") as f:
         f.write(text + "\n")
 
-    # ---- 8. Save outputs -------------------------------------------------
+    # ---- 9. Save outputs -------------------------------------------------
     # FITS
     fits_path = output_dir / "halpha_model.fits"
     save_synthetic_spectrum(waveobs, flux, fits_path)
