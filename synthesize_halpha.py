@@ -353,7 +353,7 @@ def report_lines_in_window(waveobs: np.ndarray, flux: np.ndarray,
             continue
         depth = float(1.0 - np.min(flux[pix]))
         if depth >= depth_threshold:
-            rows.append((species, wl, depth))
+            rows.append((species, wl, depth, theo_depth))
 
     # --- Inject H-alpha explicitly (not in the atomic .tsv linelist) --------
     halpha_wl = HALPHA_NM
@@ -363,23 +363,24 @@ def report_lines_in_window(waveobs: np.ndarray, flux: np.ndarray,
         if pix.sum() >= 2:
             halpha_depth = float(1.0 - np.min(flux[pix]))
             # Remove any atomic-linelist entry that accidentally matched Hα
-            rows = [(s, w, d) for s, w, d in rows if abs(w - halpha_wl) > 0.01]
+            rows = [(s, w, d, td) for s, w, d, td in rows if abs(w - halpha_wl) > 0.01]
             if halpha_depth >= depth_threshold:
-                rows.append(("H I", halpha_wl, halpha_depth))
+                rows.append(("H I", halpha_wl, halpha_depth, float("nan")))
 
     # --- Sort by wavelength -------------------------------------------------
     rows.sort(key=lambda r: r[1])
 
     # --- Format table -------------------------------------------------------
     header    = f"\n  Lines with depth > {depth_threshold:.2f} in {win_min:.3f}–{win_max:.3f} nm\n"
-    separator = "  " + "─" * 44
-    col_hdr   = f"  {'Species':<10}  {'Wave (nm)':>10}  {'Depth':>8}"
-    divider   = "  " + "-" * 44
+    separator = "  " + "─" * 56
+    col_hdr   = f"  {'Species':<10}  {'Wave (nm)':>10}  {'Meas. depth':>12}  {'Theo. depth':>12}"
+    divider   = "  " + "-" * 56
 
     lines_out = [header, separator, col_hdr, divider]
     if rows:
-        for species, wl, depth in rows:
-            lines_out.append(f"  {species:<10}  {wl:>10.4f}  {depth:>8.4f}")
+        for species, wl, depth, theo_depth in rows:
+            theo_str = f"{theo_depth:>12.4f}" if np.isfinite(theo_depth) else f"{'—':>12}"
+            lines_out.append(f"  {species:<10}  {wl:>10.4f}  {depth:>12.4f}  {theo_str}")
     else:
         lines_out.append("  (no lines above threshold)")
     lines_out.append(separator + "\n")
