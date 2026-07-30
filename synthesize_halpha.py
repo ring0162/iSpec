@@ -303,86 +303,121 @@ def synthesize_halpha(params: dict,
 
 
 # ---------------------------------------------------------------------------
-# Line inventory in the synthesis window
+# Line inventory in the synthesis window — peak-finding approach
 # ---------------------------------------------------------------------------
 
 def report_lines_in_window(waveobs: np.ndarray, flux: np.ndarray,
                            atomic_linelist,
                            win_min: float = 655.7,
                            win_max: float = 656.8,
-                           depth_threshold: float = 0.05,
-                           measure_window_nm: float = 0.05,
+                           min_depth: float = 0.01,
+                           min_prominence: float = 0.005,
+                           min_sep_nm: float = 0.03,
+                           id_tolerance_nm: float = 0.08,
                            out_file: Path | None = None) -> None:
     """
-    Print (and optionally write) a table of every line in [win_min, win_max]
-    whose synthesised depth exceeds depth_threshold.
+    Detect every absorption feature actually present in the synthesised
+    spectrum within [win_min, win_max] and identify each one against the
+    atomic linelist.
 
-    H-alpha (H I 656.279 nm) is injected explicitly because it lives in the
-    internal Hlinedata file rather than the user atomic linelist.
+    Uses scipy.signal.find_peaks on the inverted flux (absorption depth
+    array) so the detected features are driven entirely by what is in the
+    model spectrum, not by the linelist's theoretical_depth field.
 
     Parameters
     ----------
-    waveobs, flux     : synthesised spectrum arrays (nm, normalised)
-    atomic_linelist   : iSpec recarray from read_atomic_linelist
-    win_min, win_max  : wavelength window to inspect (nm)
-    depth_threshold   : minimum depth (1 − F_min) to include in the table
-    measure_window_nm : half-width of the window used to find F_min per line (nm)
-    out_file          : if given, the table is appended to this file as well
+    waveobs, flux    : synthesised spectrum (nm, continuum-normalised)
+    atomic_linelist  : iSpec recarray from read_atomic_linelist
+    win_min, win_max : wavelength window to inspect (nm)
+    min_depth        : minimum depth from the continuum (1 − F) to report
+    min_prominence   : minimum peak prominence relative to local surroundings;
+                       controls detection of shallow features in H-alpha wings
+    min_sep_nm       : minimum separation between two reported features (nm)
+    id_tolerance_nm  : maximum wavelength offset when matching a detected
+                       feature to a linelist entry (nm)
+    out_file         : if given, the table is also appended to this file
     """
-    # --- Collect candidate lines from the atomic linelist -------------------
-    mask = (atomic_linelist["wave_nm"] >= win_min) & \
-           (atomic_linelist["wave_nm"] <= win_max)
-    candidates = atomic_linelist[mask]
+    from scipy.signal import find_peaks
 
+    # --- Trim to window -----------------------------------------------------
+    win_mask = (waveobs >= win_min) & (waveobs <= win_max)
+    w = waveobs[win_mask]
+    f = flux[win_mask]
+
+    if len(w) < 5:
+        print(f"  [line inventory] Fewer than 5 pixels in {win_min}–{win_max} nm; skipping.")
+        return
+
+    wave_step = float(np.median(np.diff(w)))
+    min_sep_pix = max(1, int(min_sep_nm / wave_step))
+
+    absorption = 1.0 - f
+
+    peak_idx, properties = find_peaks(
+        absorption,
+        height=min_depth,
+        prominence=min_prominence,
+        distance=min_sep_pix,
+    )
+
+    # --- Build linelist lookup (within window + tolerance) ------------------
+    lookup_mask = (
+        (atomic_linelist["wave_nm"] >= win_min - id_tolerance_nm) &
+        (atomic_linelist["wave_nm"] <= win_max + id_tolerance_nm)
+    )
+    lookup = atomic_linelist[lookup_mask]
+
+    # --- Match each detected peak to the nearest linelist entry -------------
     rows = []
-    for line in candidates:
-        wl            = float(line["wave_nm"])
-        species       = str(line["element"]).strip()
-        theo_depth    = float(line["theoretical_depth"])
+    for idx in peak_idx:
+        wl_det   = float(w[idx])
+        depth    = float(absorption[idx])
+        prom     = float(properties["prominences"][list(peak_idx).index(idx)])
 
-        # Require the solar theoretical depth to pass the threshold first.
-        # This prevents weak lines near the H-alpha core from inheriting
-        # H-alpha's measured depth due to an overlapping measurement window.
-        if theo_depth < depth_threshold:
-            continue
+        # Nearest linelist match within tolerance
+        if len(lookup) > 0:
+            offsets = np.abs(lookup["wave_nm"] - wl_det)
+            best    = int(np.argmin(offsets))
+            if offsets[best] <= id_tolerance_nm:
+                species    = str(lookup["element"][best]).strip()
+                theo_depth = float(lookup["theoretical_depth"][best])
+                wl_list    = float(lookup["wave_nm"][best])
+            else:
+                species    = "?"
+                theo_depth = float("nan")
+                wl_list    = float("nan")
+        else:
+            species    = "?"
+            theo_depth = float("nan")
+            wl_list    = float("nan")
 
-        w_lo = wl - measure_window_nm
-        w_hi = wl + measure_window_nm
-        pix  = (waveobs >= w_lo) & (waveobs <= w_hi)
-        if pix.sum() < 2:
-            continue
-        depth = float(1.0 - np.min(flux[pix]))
-        if depth >= depth_threshold:
-            rows.append((species, wl, depth, theo_depth))
+        # Override identification for H-alpha (not in atomic .tsv linelist)
+        if abs(wl_det - HALPHA_NM) <= id_tolerance_nm and depth > 0.3:
+            species    = "H I"
+            theo_depth = float("nan")
+            wl_list    = HALPHA_NM
 
-    # --- Inject H-alpha explicitly (not in the atomic .tsv linelist) --------
-    halpha_wl = HALPHA_NM
-    if win_min <= halpha_wl <= win_max:
-        pix = (waveobs >= halpha_wl - measure_window_nm) & \
-              (waveobs <= halpha_wl + measure_window_nm)
-        if pix.sum() >= 2:
-            halpha_depth = float(1.0 - np.min(flux[pix]))
-            # Remove any atomic-linelist entry that accidentally matched Hα
-            rows = [(s, w, d, td) for s, w, d, td in rows if abs(w - halpha_wl) > 0.01]
-            if halpha_depth >= depth_threshold:
-                rows.append(("H I", halpha_wl, halpha_depth, float("nan")))
-
-    # --- Sort by wavelength -------------------------------------------------
-    rows.sort(key=lambda r: r[1])
+        rows.append((wl_det, species, wl_list, depth, prom, theo_depth))
 
     # --- Format table -------------------------------------------------------
-    header    = f"\n  Lines with depth > {depth_threshold:.2f} in {win_min:.3f}–{win_max:.3f} nm\n"
-    separator = "  " + "─" * 56
-    col_hdr   = f"  {'Species':<10}  {'Wave (nm)':>10}  {'Meas. depth':>12}  {'Theo. depth':>12}"
-    divider   = "  " + "-" * 56
+    header    = (f"\n  Spectral features detected in {win_min:.3f}–{win_max:.3f} nm"
+                 f"  (min_depth={min_depth:.3f}, min_prominence={min_prominence:.3f})\n")
+    separator = "  " + "─" * 74
+    col_hdr   = (f"  {'Detected (nm)':>13}  {'ID':>8}  {'List (nm)':>10}"
+                 f"  {'Meas.depth':>11}  {'Prominence':>11}  {'Theo.depth':>11}")
+    divider   = "  " + "-" * 74
 
     lines_out = [header, separator, col_hdr, divider]
     if rows:
-        for species, wl, depth, theo_depth in rows:
-            theo_str = f"{theo_depth:>12.4f}" if np.isfinite(theo_depth) else f"{'—':>12}"
-            lines_out.append(f"  {species:<10}  {wl:>10.4f}  {depth:>12.4f}  {theo_str}")
+        for wl_det, species, wl_list, depth, prom, theo_depth in rows:
+            list_str = f"{wl_list:>10.4f}" if np.isfinite(wl_list) else f"{'—':>10}"
+            theo_str = f"{theo_depth:>11.4f}" if np.isfinite(theo_depth) else f"{'—':>11}"
+            lines_out.append(
+                f"  {wl_det:>13.4f}  {species:>8}  {list_str}"
+                f"  {depth:>11.4f}  {prom:>11.4f}  {theo_str}"
+            )
     else:
-        lines_out.append("  (no lines above threshold)")
+        lines_out.append("  (no features detected above threshold)")
     lines_out.append(separator + "\n")
 
     text = "\n".join(lines_out)
@@ -549,8 +584,17 @@ def parse_args():
         help="Red edge of the line-inventory window in nm (default: 656.8)"
     )
     p.add_argument(
-        "--line-depth-min", type=float, default=0.05, metavar="DEPTH",
-        help="Minimum synthesised line depth to include in the inventory table (default: 0.05)"
+        "--line-depth-min", type=float, default=0.01, metavar="DEPTH",
+        help="Minimum absorption depth (1−F) for a feature to appear in the table (default: 0.01)"
+    )
+    p.add_argument(
+        "--line-prominence", type=float, default=0.005, metavar="PROM",
+        help="Minimum peak prominence relative to local surroundings (default: 0.005). "
+             "Raise this to suppress features in the broad H-alpha wings."
+    )
+    p.add_argument(
+        "--line-sep", type=float, default=0.03, metavar="NM",
+        help="Minimum separation between reported features in nm (default: 0.03)"
     )
 
     # ---- Comparison spectrum ----------------------------------------------
@@ -642,7 +686,9 @@ def main():
         waveobs, flux, atomic_linelist,
         win_min=args.line_win_min,
         win_max=args.line_win_max,
-        depth_threshold=args.line_depth_min,
+        min_depth=args.line_depth_min,
+        min_prominence=args.line_prominence,
+        min_sep_nm=args.line_sep,
         out_file=output_dir / "halpha_synth.log",
     )
 
